@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>DÍNAMO — Análisis de velocidad</title>
+<meta name="theme-color" content="#0c0c0e" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+<meta name="apple-mobile-web-app-title" content="DÍNAMO" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { background: #0c0c0e; }
+  #boot {
+    position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #c8ff00; font-family: monospace;
+    font-size: 12px; letter-spacing: 2px;
+  }
+</style>
+</head>
+<body>
+<div id="boot">CARGANDO DÍNAMO…</div>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ============================================================
+   DÍNAMO — Análisis de velocidad de movimiento (VBT)
+   Prototipo: subida al cajón con sticker de referencia.
+   ============================================================ */
+
+const G = 9.81; // gravedad m/s2
+
+/* ---------- Persistencia (localStorage) ---------- */
+const KEY_PEOPLE = "dinamo:people:v2";
+const keyAnalyses = (id) => "dinamo:analyses:" + id + ":v2";
+
+function loadPeople() {
+  try { const r = localStorage.getItem(KEY_PEOPLE); return r ? JSON.parse(r) : []; }
+  catch { return []; }
+}
+function savePeople(people) {
+  try { localStorage.setItem(KEY_PEOPLE, JSON.stringify(people)); }
+  catch (e) { console.error("savePeople", e); }
+}
+function loadAnalyses(personId) {
+  try { const r = localStorage.getItem(keyAnalyses(personId)); return r ? JSON.parse(r) : []; }
+  catch { return []; }
+}
+function saveAnalyses(personId, list) {
+  try { localStorage.setItem(keyAnalyses(personId), JSON.stringify(list)); }
+  catch (e) { console.error("saveAnalyses", e); }
+}
+
+/* ---------- Visión: detección del sticker blanco ---------- */
+function detectBlob(data, W, H, cx, cy, radius, threshold, satMax) {
+  let minX = W, minY = H, maxX = 0, maxY = 0, count = 0;
+  const x0 = Math.max(0, (cx - radius) | 0), x1 = Math.min(W, (cx + radius) | 0);
+  const y0 = Math.max(0, (cy - radius) | 0), y1 = Math.min(H, (cy + radius) | 0);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = (y * W + x) * 4;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
+      if (mn >= threshold && (mx - mn) <= satMax) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        count++;
+      }
+    }
+  }
+  if (count < 10) return null;
+  return {
+    minX, minY, maxX, maxY, count,
+    cx: (minX + maxX) / 2, cy: (minY + maxY) / 2,
+    w: maxX - minX + 1, h: maxY - minY + 1,
+  };
+}
+
+function trackCentroid(data, W, H, px, py, radius, threshold, satMax) {
+  let sx = 0, sy = 0, sw = 0, count = 0;
+  const x0 = Math.max(0, (px - radius) | 0), x1 = Math.min(W, (px + radius) | 0);
+  const y0 = Math.max(0, (py - radius) | 0), y1 = Math.min(H, (py + radius) | 0);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = (y * W + x) * 4;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
+      if (mn >= threshold && (mx - mn) <= satMax) {
+        const w = mn;
+        sx += x * w; sy += y * w; sw += w; count++;
+      }
+    }
+  }
+  if (count < 6) return null;
+  return { x: sx / sw, y: sy / sw, count };
+}
+
+/* ---------- Cinemática ---------- */
+function movingAvg(arr, win) {
+  const half = Math.floor(win / 2), out = [];
+  for (let i = 0; i < arr.length; i++) {
+    let s = 0, n = 0;
+    for (let j = i - half; j <= i + half; j++) {
+      if (j >= 0 && j < arr.length) { s += arr[j]; n++; }
+    }
+    out.push(s / n);
+  }
+  return out;
+}
+
+function computeMetrics(track, pxPerCm, bodyWeightKg) {
+  const t = track.map((p) => p.t);
+  const ys = movingAvg(track.map((p) => p.y), 5);
+  const yMax = Math.max.apply(null, ys);
+  const heightM = ys.map((y) => (yMax - y) / pxPerCm / 100);
+
+  const vel = heightM.map((_, i) => {
+    if (i === 0 || i === heightM.length - 1) return 0;
+    const dt = t[i + 1] - t[i - 1];
+    return dt > 0 ? (heightM[i + 1] - heightM[i - 1]) / dt : 0;
+  });
+  const velS = movingAvg(vel, 5);
+
+  const accel = velS.map((_, i) => {
+    if (i === 0 || i === velS.length - 1) return 0;
+    const dt = t[i + 1] - t[i - 1];
+    return dt > 0 ? (velS[i + 1] - velS[i - 1]) / dt : 0;
+  });
+  const accelS = movingAvg(accel, 5);
+
+  let endI = 0;
+  heightM.forEach((h, i) => { if (h > heightM[endI]) endI = i; });
+  let startI = 0;
+  for (let i = 0; i <= endI; i++) if (heightM[i] < heightM[startI]) startI = i;
+  if (startI >= endI) { startI = 0; endI = heightM.length - 1; }
+
+  const romCm = (heightM[endI] - heightM[startI]) * 100;
+  const durationS = t[endI] - t[startI];
+  const meanVel = durationS > 0 ? (heightM[endI] - heightM[startI]) / durationS : 0;
+
+  let peakVel = 0, maxAccel = 0;
+  for (let i = startI; i <= endI; i++) {
+    if (velS[i] > peakVel) peakVel = velS[i];
+    if (Math.abs(accelS[i]) > maxAccel) maxAccel = Math.abs(accelS[i]);
+  }
+
+  let powerSum = 0, powerN = 0, peakPower = 0;
+  if (bodyWeightKg > 0) {
+    for (let i = startI; i <= endI; i++) {
+      if (velS[i] > 0.02) {
+        const p = bodyWeightKg * (G + accelS[i]) * velS[i];
+        if (p > 0) { powerSum += p; powerN++; if (p > peakPower) peakPower = p; }
+      }
+    }
+  }
+  const meanPower = powerN > 0 ? powerSum / powerN : 0;
+
+  const tracked = track.filter((p) => p.tracked).length;
+  const quality = track.length ? tracked / track.length : 0;
+
+  const t0 = t[startI];
+  const series = track.map((p, i) => ({
+    t: +(t[i] - t0).toFixed(3),
+    height: +(heightM[i] * 100).toFixed(1),
+    vel: +velS[i].toFixed(3),
+    accel: +accelS[i].toFixed(2),
+  }));
+
+  return {
+    meanVel, peakVel, maxAccel, romCm, durationS,
+    meanPower, peakPower, quality,
+    series, concentricDuration: durationS,
+  };
+}
+
+/* ---------- Formato ---------- */
+const fmt = (n, d = 2) => (isFinite(n) ? n.toFixed(d) : "—");
+const fmtDate = (iso) => {
+  const d = new Date(iso);
+  return d.toLocaleDateString("es-AR", { day: "2-digit", month: "short" }) +
+    " " + d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+};
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+/* ============================================================
+   ICONOS (SVG propios, sin dependencias)
+   ============================================================ */
+const ICONS = {
+  "chevron-left": <polyline points="15 18 9 12 15 6" />,
+  "plus": <g><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></g>,
+  "activity": <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />,
+  "upload": <g><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></g>,
+  "crosshair": <g><circle cx="12" cy="12" r="9" /><line x1="12" y1="1" x2="12" y2="5" /><line x1="12" y1="19" x2="12" y2="23" /><line x1="1" y1="12" x2="5" y2="12" /><line x1="19" y1="12" x2="23" y2="12" /></g>,
+  "play": <polygon points="6 4 20 12 6 20 6 4" />,
+  "trash": <g><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" /></g>,
+  "user": <g><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></g>,
+  "gauge": <g><path d="M12 13l4-4" /><path d="M3.5 18a10 10 0 1 1 17 0" /></g>,
+  "trending-up": <g><polyline points="23 6 13.5 15.5 8.5 10.5 1 18" /><polyline points="17 6 23 6 23 12" /></g>,
+  "zap": <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />,
+  "ruler": <g><path d="M3 9l12 12 6-6L9 3z" /><line x1="8.5" y1="7.5" x2="10" y2="9" /><line x1="12" y1="11" x2="13.5" y2="12.5" /><line x1="6" y1="12" x2="7.5" y2="13.5" /></g>,
+  "clock": <g><circle cx="12" cy="12" r="9" /><polyline points="12 7 12 12 16 14" /></g>,
+  "target": <g><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1.6" /></g>,
+  "alert": <g><path d="M10.3 3.5L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.5a2 2 0 0 0-3.4 0z" /><line x1="12" y1="9" x2="12" y2="13.5" /><line x1="12" y1="17" x2="12.01" y2="17" /></g>,
+  "check": <polyline points="20 6 9 17 4 12" />,
+  "rotate": <g><polyline points="1 4 1 10 7 10" /><path d="M3.5 15a9 9 0 1 0 2.1-9.4L1 10" /></g>,
+};
+const SOLID = { play: true, zap: true };
+
+function Icon({ name, size = 16, color = "currentColor", style }) {
+  const solid = SOLID[name];
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24"
+      fill={solid ? color : "none"} stroke={solid ? "none" : color}
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={style}>
+      {ICONS[name]}
+    </svg>
+  );
+}
+
+/* ============================================================
+   ESTILOS
+   ============================================================ */
+const CSS = `
+.dinamo {
+  --bg: #0c0c0e; --panel: #151518; --panel2: #1c1c21;
+  --border: #2b2b32; --text: #ebebe8; --dim: #82828a;
+  --accent: #c8ff00; --accent2: #ff5c38;
+  font-family: 'IBM Plex Sans', sans-serif;
+  background: var(--bg); color: var(--text);
+  min-height: 100vh; width: 100%;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.dinamo .wrap { max-width: 560px; margin: 0 auto; padding: 0 16px 64px; }
+.dinamo .topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 18px 16px 16px; max-width: 560px; margin: 0 auto;
+  position: sticky; top: 0; z-index: 20;
+  background: linear-gradient(180deg, var(--bg) 70%, transparent);
+}
+.dinamo .logo {
+  font-family: 'Bebas Neue', sans-serif; font-size: 30px;
+  letter-spacing: 2px; line-height: 1;
+}
+.dinamo .logo b { color: var(--accent); }
+.dinamo .logo-dot {
+  width: 9px; height: 9px; background: var(--accent);
+  display: inline-block; border-radius: 50%; margin-left: 2px;
+  box-shadow: 0 0 10px var(--accent);
+}
+.dinamo .tagline {
+  font-family: 'IBM Plex Mono', monospace; font-size: 9.5px;
+  letter-spacing: 1.5px; color: var(--dim); text-transform: uppercase;
+}
+.dinamo .iconbtn {
+  width: 38px; height: 38px; flex: 0 0 38px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--panel); border: 1px solid var(--border);
+  color: var(--text); cursor: pointer; transition: .15s;
+}
+.dinamo .iconbtn:hover { border-color: var(--accent); color: var(--accent); }
+.dinamo .seclabel {
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+  letter-spacing: 2px; color: var(--dim); text-transform: uppercase;
+  margin: 22px 0 10px; display: flex; align-items: center; gap: 8px;
+}
+.dinamo .seclabel::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.dinamo .card {
+  background: var(--panel); border: 1px solid var(--border);
+  padding: 16px; transition: .15s;
+}
+.dinamo .card.tap { cursor: pointer; }
+.dinamo .card.tap:hover { border-color: var(--accent); }
+.dinamo .person-row { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+.dinamo .avatar {
+  width: 44px; height: 44px; flex: 0 0 44px;
+  background: var(--panel2); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'Bebas Neue', sans-serif; font-size: 22px; color: var(--accent);
+}
+.dinamo .person-name {
+  font-family: 'Bebas Neue', sans-serif; font-size: 22px;
+  letter-spacing: .5px; line-height: 1.1;
+}
+.dinamo .person-meta {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  color: var(--dim); margin-top: 2px;
+}
+.dinamo .btn {
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+  letter-spacing: 1px; text-transform: uppercase; font-weight: 600;
+  padding: 14px 18px; border: 1px solid var(--border);
+  background: var(--panel2); color: var(--text); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; transition: .15s;
+}
+.dinamo .btn:hover { border-color: var(--accent); }
+.dinamo .btn.primary { background: var(--accent); color: #0c0c0e; border-color: var(--accent); }
+.dinamo .btn.primary:hover { box-shadow: 0 0 16px rgba(200,255,0,.35); }
+.dinamo .btn.ghost { background: transparent; }
+.dinamo .btn:disabled { opacity: .4; cursor: not-allowed; }
+.dinamo .btn.danger:hover { border-color: var(--accent2); color: var(--accent2); }
+.dinamo label.fld {
+  display: block; font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px; letter-spacing: 1px; color: var(--dim);
+  text-transform: uppercase; margin: 14px 0 5px;
+}
+.dinamo input.txt, .dinamo textarea.txt, .dinamo select.txt {
+  width: 100%; background: var(--bg); border: 1px solid var(--border);
+  color: var(--text); padding: 11px 12px; font-size: 16px;
+  font-family: 'IBM Plex Sans', sans-serif;
+}
+.dinamo input.txt:focus, .dinamo textarea.txt:focus, .dinamo select.txt:focus {
+  outline: none; border-color: var(--accent);
+}
+.dinamo .row2 { display: flex; gap: 10px; }
+.dinamo .row2 > * { flex: 1; }
+.dinamo .overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.7);
+  display: flex; align-items: flex-end; justify-content: center; z-index: 50;
+}
+.dinamo .modal {
+  background: var(--panel); border-top: 2px solid var(--accent);
+  width: 100%; max-width: 560px; padding: 22px 18px 26px;
+  max-height: 90vh; overflow-y: auto;
+}
+.dinamo .modal h3 {
+  font-family: 'Bebas Neue', sans-serif; font-size: 26px;
+  letter-spacing: 1px; margin-bottom: 4px;
+}
+.dinamo .mgrid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+  background: var(--border); border: 1px solid var(--border);
+}
+.dinamo .metric { background: var(--panel); padding: 14px 13px; }
+.dinamo .metric .mlabel {
+  font-family: 'IBM Plex Mono', monospace; font-size: 9.5px;
+  letter-spacing: 1px; color: var(--dim); text-transform: uppercase;
+  display: flex; align-items: center; gap: 5px;
+}
+.dinamo .metric .mval {
+  font-family: 'Bebas Neue', sans-serif; font-size: 38px;
+  line-height: 1; margin-top: 6px; color: var(--accent);
+}
+.dinamo .metric .mval.alt { color: var(--accent2); }
+.dinamo .metric .munit {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  color: var(--dim); margin-left: 4px;
+}
+.dinamo .hero {
+  border: 1px solid var(--accent); background: var(--panel);
+  padding: 18px; text-align: center; position: relative; overflow: hidden;
+}
+.dinamo .hero::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: var(--accent);
+}
+.dinamo .hero .hval {
+  font-family: 'Bebas Neue', sans-serif; font-size: 76px;
+  line-height: .9; color: var(--accent);
+}
+.dinamo .hero .hlabel {
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+  letter-spacing: 2px; color: var(--dim); text-transform: uppercase;
+}
+.dinamo .cvwrap {
+  position: relative; border: 1px solid var(--border);
+  background: #000; line-height: 0; touch-action: none;
+}
+.dinamo canvas.frame { width: 100%; display: block; }
+.dinamo input[type=range] { width: 100%; accent-color: var(--accent); margin-top: 6px; }
+.dinamo .hint { font-size: 12px; color: var(--dim); line-height: 1.55; }
+.dinamo .pill {
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+  padding: 3px 8px; border: 1px solid var(--border);
+  color: var(--dim); display: inline-flex; align-items: center; gap: 4px;
+}
+.dinamo .pill.good { color: var(--accent); border-color: var(--accent); }
+.dinamo .pill.warn { color: var(--accent2); border-color: var(--accent2); }
+.dinamo .empty { text-align: center; padding: 48px 20px; color: var(--dim); }
+.dinamo .empty .big {
+  font-family: 'Bebas Neue', sans-serif; font-size: 28px;
+  color: var(--text); margin: 12px 0 6px;
+}
+.dinamo .progress {
+  height: 6px; background: var(--panel2); border: 1px solid var(--border); overflow: hidden;
+}
+.dinamo .progress > div { height: 100%; background: var(--accent); transition: width .1s; }
+.dinamo .step-dots { display: flex; gap: 6px; margin-bottom: 14px; }
+.dinamo .step-dots > div { flex: 1; height: 3px; background: var(--border); }
+.dinamo .step-dots > div.on { background: var(--accent); }
+.dinamo .infobox {
+  background: var(--panel2); border-left: 2px solid var(--accent);
+  padding: 11px 13px; font-size: 12px; color: var(--dim); line-height: 1.55;
+}
+.dinamo .infobox.warn { border-left-color: var(--accent2); }
+.dinamo .delta {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  display: inline-flex; align-items: center; gap: 3px;
+}
+.dinamo .delta.up { color: var(--accent); }
+.dinamo .delta.down { color: var(--accent2); }
+.dinamo .spin {
+  width: 14px; height: 14px; border: 2px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: dspin .7s linear infinite; display: inline-block;
+}
+@keyframes dspin { to { transform: rotate(360deg); } }
+.dinamo .vhidden {
+  position: fixed; width: 2px; height: 2px; opacity: 0;
+  pointer-events: none; left: -20px; top: -20px;
+}
+`;
+
+/* ============================================================
+   GRÁFICOS (SVG propios)
+   ============================================================ */
+function Sparkline({ values }) {
+  if (values.length < 2) return null;
+  const W = 320, H = 46, p = 5;
+  const min = Math.min.apply(null, values), max = Math.max.apply(null, values);
+  const x = (i) => p + (i / (values.length - 1)) * (W - 2 * p);
+  const y = (v) => p + (1 - (v - min) / ((max - min) || 1)) * (H - 2 * p);
+  const d = values.map((v, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1)).join(" ");
+  return (
+    <svg viewBox={"0 0 " + W + " " + H} style={{ width: "100%", height: H }}>
+      <path d={d} fill="none" stroke="var(--accent)" strokeWidth="2" />
+      {values.map((v, i) => (
+        <circle key={i} cx={x(i)} cy={y(v)} r="2.6" fill="var(--accent)" />
+      ))}
+    </svg>
+  );
+}
+
+function PerfChart({ series, concentricDuration }) {
+  if (!series || series.length < 2) return null;
+  const W = 340, H = 210, padL = 30, padR = 14, padT = 12, padB = 26;
+  const ts = series.map((s) => s.t);
+  const tMin = Math.min.apply(null, ts), tMax = Math.max.apply(null, ts);
+  const vArr = series.map((s) => s.vel), hArr = series.map((s) => s.height);
+  const vMax = Math.max(0.05, Math.max.apply(null, vArr));
+  const vMin = Math.min(0, Math.min.apply(null, vArr));
+  const hMax = Math.max(0.05, Math.max.apply(null, hArr));
+  const hMin = Math.min(0, Math.min.apply(null, hArr));
+  const x = (t) => padL + ((t - tMin) / ((tMax - tMin) || 1)) * (W - padL - padR);
+  const yV = (v) => padT + (1 - (v - vMin) / ((vMax - vMin) || 1)) * (H - padT - padB);
+  const yH = (h) => padT + (1 - (h - hMin) / ((hMax - hMin) || 1)) * (H - padT - padB);
+  const velPath = series.map((s, i) => (i ? "L" : "M") + x(s.t).toFixed(1) + " " + yV(s.vel).toFixed(1)).join(" ");
+  const hPath = series.map((s, i) => (i ? "L" : "M") + x(s.t).toFixed(1) + " " + yH(s.height).toFixed(1)).join(" ");
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => padT + f * (H - padT - padB));
+  const zeroY = yV(0);
+  return (
+    <div style={{ marginTop: 4 }}>
+      <svg viewBox={"0 0 " + W + " " + H} style={{ width: "100%", height: "auto" }}>
+        {grid.map((gy, i) => (
+          <line key={i} x1={padL} y1={gy} x2={W - padR} y2={gy}
+            stroke="#2b2b32" strokeDasharray="2 4" />
+        ))}
+        {concentricDuration > 0 && (
+          <rect x={x(0)} y={padT} width={Math.max(0, x(concentricDuration) - x(0))}
+            height={H - padT - padB} fill="#c8ff00" fillOpacity="0.07" />
+        )}
+        <line x1={padL} y1={zeroY} x2={W - padR} y2={zeroY} stroke="#3a3a42" />
+        <path d={hPath} fill="none" stroke="#82828a" strokeWidth="1.5" strokeDasharray="3 3" />
+        <path d={velPath} fill="none" stroke="#c8ff00" strokeWidth="2.5"
+          strokeLinejoin="round" strokeLinecap="round" />
+        <text x={padL - 4} y={yV(vMax) + 3} fill="#82828a" fontSize="9"
+          textAnchor="end" fontFamily="IBM Plex Mono">{vMax.toFixed(1)}</text>
+        <text x={padL - 4} y={zeroY + 3} fill="#82828a" fontSize="9"
+          textAnchor="end" fontFamily="IBM Plex Mono">0</text>
+        <text x={padL} y={H - 8} fill="#82828a" fontSize="9"
+          fontFamily="IBM Plex Mono">{tMin.toFixed(1)}s</text>
+        <text x={W - padR} y={H - 8} fill="#82828a" fontSize="9"
+          textAnchor="end" fontFamily="IBM Plex Mono">{tMax.toFixed(1)}s</text>
+      </svg>
+      <div className="hint" style={{ textAlign: "center", marginTop: 2 }}>
+        <span style={{ color: "var(--accent)" }}>━ velocidad (m/s)</span> &nbsp;
+        <span style={{ color: "var(--dim)" }}>┄ altura (cm)</span> &nbsp;·&nbsp;
+        zona sombreada = fase de empuje
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   COMPONENTES
+   ============================================================ */
+function Header({ onBack, title }) {
+  return (
+    <div className="topbar">
+      {onBack ? (
+        <button className="iconbtn" onClick={onBack}><Icon name="chevron-left" size={20} /></button>
+      ) : (
+        <div style={{ width: 38, height: 38, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Icon name="activity" size={20} color="var(--accent)" />
+        </div>
+      )}
+      <div style={{ flex: 1 }}>
+        <div className="logo">
+          {title ? title : <span><b>DÍ</b>NAMO<span className="logo-dot" /></span>}
+        </div>
+        {!title && <div className="tagline">Análisis de velocidad de movimiento</div>}
+      </div>
+    </div>
+  );
+}
+
+function PeopleScreen({ people, onOpen, onAdd }) {
+  return (
+    <div>
+      <Header />
+      <div className="wrap">
+        <div className="seclabel">Atletas / clientes</div>
+        {people.length === 0 ? (
+          <div className="empty">
+            <Icon name="user" size={40} color="var(--dim)" />
+            <div className="big">Sin perfiles aún</div>
+            <div className="hint">Creá un perfil para empezar a registrar análisis.</div>
+          </div>
+        ) : (
+          people.map((p) => (
+            <div key={p.id} className="card tap" style={{ marginBottom: 8 }} onClick={() => onOpen(p)}>
+              <div className="person-row" style={{ marginBottom: 0 }}>
+                <div className="avatar">{p.name.slice(0, 1).toUpperCase()}</div>
+                <div style={{ flex: 1 }}>
+                  <div className="person-name">{p.name}</div>
+                  <div className="person-meta">
+                    {[p.age && p.age + " años", p.weight && p.weight + " kg", p.height && p.height + " cm"]
+                      .filter(Boolean).join("  ·  ") || "Sin datos"}
+                  </div>
+                </div>
+                <Icon name="chevron-left" size={18} color="var(--dim)" style={{ transform: "rotate(180deg)" }} />
+              </div>
+            </div>
+          ))
+        )}
+        <div style={{ marginTop: 14 }}>
+          <button className="btn primary" onClick={onAdd}>
+            <Icon name="plus" size={16} /> Nuevo perfil
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PersonForm({ initial, onSave, onClose }) {
+  const [f, setF] = useState(initial || { name: "", age: "", weight: "", height: "", notes: "" });
+  const set = (k) => (e) => setF(Object.assign({}, f, { [k]: e.target.value }));
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>{initial ? "Editar perfil" : "Nuevo perfil"}</h3>
+        <div className="hint">Los datos quedan guardados en este dispositivo.</div>
+        <label className="fld">Nombre *</label>
+        <input className="txt" value={f.name} onChange={set("name")} placeholder="Nombre y apellido" />
+        <div className="row2">
+          <div>
+            <label className="fld">Edad</label>
+            <input className="txt" type="number" value={f.age} onChange={set("age")} placeholder="años" />
+          </div>
+          <div>
+            <label className="fld">Peso (kg) *</label>
+            <input className="txt" type="number" value={f.weight} onChange={set("weight")} placeholder="kg" />
+          </div>
+          <div>
+            <label className="fld">Altura (cm)</label>
+            <input className="txt" type="number" value={f.height} onChange={set("height")} placeholder="cm" />
+          </div>
+        </div>
+        <label className="fld">Notas</label>
+        <textarea className="txt" rows={2} value={f.notes} onChange={set("notes")}
+          placeholder="Lesiones, objetivos, observaciones..." />
+        <div className="infobox" style={{ marginTop: 14 }}>
+          El <b>peso corporal</b> se usa para estimar la potencia de la subida al cajón.
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button className="btn ghost" onClick={onClose}>Cancelar</button>
+          <button className="btn primary" disabled={!f.name.trim() || !f.weight}
+            onClick={() => onSave({
+              name: f.name, notes: f.notes,
+              id: (initial && initial.id) || uid(),
+              age: f.age ? +f.age : null,
+              weight: f.weight ? +f.weight : null,
+              height: f.height ? +f.height : null,
+              createdAt: (initial && initial.createdAt) || new Date().toISOString(),
+            })}>
+            Guardar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PersonScreen({ person, analyses, onBack, onNewAnalysis, onOpenResult, onEdit, onDelete }) {
+  const sorted = analyses.slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+  const spark = analyses.slice()
+    .sort((a, b) => new Date(a.date) - new Date(b.date))
+    .map((a) => a.metrics.meanVel);
+  return (
+    <div>
+      <Header onBack={onBack} title={person.name.toUpperCase()} />
+      <div className="wrap">
+        <div className="card">
+          <div className="person-row" style={{ marginBottom: 12 }}>
+            <div className="avatar">{person.name.slice(0, 1).toUpperCase()}</div>
+            <div style={{ flex: 1 }}>
+              <div className="person-meta">
+                {[person.age && person.age + " años", person.weight && person.weight + " kg",
+                  person.height && person.height + " cm"].filter(Boolean).join("  ·  ")}
+              </div>
+              {person.notes && <div className="hint" style={{ marginTop: 4 }}>{person.notes}</div>}
+            </div>
+          </div>
+          {spark.length > 1 && (
+            <div>
+              <Sparkline values={spark} />
+              <div className="hint" style={{ textAlign: "center" }}>
+                Evolución de velocidad media — {spark.length} análisis
+              </div>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button className="btn ghost" onClick={onEdit} style={{ fontSize: 11 }}>Editar perfil</button>
+            <button className="btn ghost danger" onClick={onDelete} style={{ fontSize: 11 }}>
+              <Icon name="trash" size={13} /> Eliminar
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 14 }}>
+          <button className="btn primary" onClick={onNewAnalysis}>
+            <Icon name="crosshair" size={16} /> Nuevo análisis · Subida al cajón
+          </button>
+        </div>
+
+        <div className="seclabel">Historial</div>
+        {sorted.length === 0 ? (
+          <div className="hint" style={{ padding: "8px 2px" }}>Todavía no hay análisis registrados.</div>
+        ) : (
+          sorted.map((a, idx) => {
+            const prev = sorted[idx + 1];
+            const delta = prev ? a.metrics.meanVel - prev.metrics.meanVel : null;
+            return (
+              <div key={a.id} className="card tap" style={{ marginBottom: 8 }} onClick={() => onOpenResult(a)}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "var(--dim)" }}>
+                      {fmtDate(a.date)}
+                    </div>
+                    <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 24, marginTop: 2 }}>
+                      {fmt(a.metrics.meanVel)}{" "}
+                      <span style={{ fontSize: 13, color: "var(--dim)" }}>m/s media</span>
+                    </div>
+                  </div>
+                  {delta !== null && (
+                    <div className={"delta " + (delta >= 0 ? "up" : "down")}>
+                      <Icon name="trending-up" size={13}
+                        style={delta >= 0 ? null : { transform: "scaleY(-1)" }} />
+                      {delta >= 0 ? "+" : ""}{fmt(delta)}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MetricsGrid({ m }) {
+  const items = [
+    { label: "Vel. pico", icon: "zap", val: fmt(m.peakVel), unit: "m/s", alt: true },
+    { label: "Acel. máx", icon: "trending-up", val: fmt(m.maxAccel, 1), unit: "m/s²" },
+    { label: "Recorrido", icon: "ruler", val: fmt(m.romCm, 1), unit: "cm" },
+    { label: "Duración", icon: "clock", val: fmt(m.durationS), unit: "s" },
+    { label: "Potencia media", icon: "gauge", val: Math.round(m.meanPower) || "—", unit: "W" },
+    { label: "Potencia pico", icon: "zap", val: Math.round(m.peakPower) || "—", unit: "W", alt: true },
+  ];
+  return (
+    <div className="mgrid">
+      {items.map((it, i) => (
+        <div className="metric" key={i}>
+          <div className="mlabel"><Icon name={it.icon} size={11} /> {it.label}</div>
+          <div className={"mval" + (it.alt ? " alt" : "")}>
+            {it.val}<span className="munit">{it.unit}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ResultScreen({ analysis, onBack }) {
+  const m = analysis.metrics;
+  return (
+    <div>
+      <Header onBack={onBack} title="ANÁLISIS" />
+      <div className="wrap">
+        <div className="hint" style={{ marginBottom: 12 }}>{fmtDate(analysis.date)}</div>
+        <div className="hero">
+          <div className="hlabel">Velocidad media de empuje</div>
+          <div className="hval">{fmt(m.meanVel)}</div>
+          <div className="hlabel">metros / segundo</div>
+        </div>
+        <div style={{ marginTop: 12 }}><MetricsGrid m={m} /></div>
+        <div className="seclabel">Curva de movimiento</div>
+        <PerfChart series={m.series} concentricDuration={m.concentricDuration} />
+        <div style={{ marginTop: 10 }}>
+          <span className={"pill " + (m.quality > 0.85 ? "good" : "warn")}>
+            <Icon name="target" size={11} /> Seguimiento {Math.round(m.quality * 100)}%
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   FLUJO DE ANÁLISIS
+   ============================================================ */
+function AnalysisScreen({ person, onBack, onSaved, previousMean }) {
+  const [step, setStep] = useState(0);
+  const [videoURL, setVideoURL] = useState(null);
+  const [fps, setFps] = useState(60);
+  const [stickerCm, setStickerCm] = useState(10);
+  const [threshold, setThreshold] = useState(170);
+  const satMax = 60;
+  const [marker, setMarker] = useState(null);
+  const [blob, setBlob] = useState(null);
+  const [proc, setProc] = useState({ w: 0, h: 0 });
+  const [progress, setProgress] = useState(0);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const firstFrameRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const onFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setError(null);
+    setVideoURL(URL.createObjectURL(file));
+  };
+
+  const onMeta = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    const maxW = 900;
+    const scale = v.videoWidth > maxW ? maxW / v.videoWidth : 1;
+    setProc({ w: Math.round(v.videoWidth * scale), h: Math.round(v.videoHeight * scale) });
+  };
+
+  const seekTo = (v, tt) => new Promise((res) => {
+    const h = () => { v.removeEventListener("seeked", h); res(); };
+    v.addEventListener("seeked", h);
+    v.currentTime = tt;
+  });
+
+  const goMark = async () => {
+    const v = videoRef.current, c = canvasRef.current;
+    if (!v || !c || proc.w === 0) { setError("El video no se cargó bien."); return; }
+    c.width = proc.w; c.height = proc.h;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    try {
+      await seekTo(v, 0.05);
+      ctx.drawImage(v, 0, 0, proc.w, proc.h);
+      firstFrameRef.current = ctx.getImageData(0, 0, proc.w, proc.h);
+      setMarker(null); setBlob(null);
+      setStep(1);
+    } catch (err) {
+      console.error(err);
+      setError("No se pudo leer el video. Probá con otro formato (mp4).");
+    }
+  };
+
+  const redraw = useCallback((mk, th) => {
+    const c = canvasRef.current, ff = firstFrameRef.current;
+    if (!c || !ff) return;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.putImageData(ff, 0, 0);
+    if (!mk) return;
+    const d = ff.data, W = ff.width, H = ff.height, R = 90;
+    const x0 = Math.max(0, mk.x - R) | 0, x1 = Math.min(W, mk.x + R) | 0;
+    const y0 = Math.max(0, mk.y - R) | 0, y1 = Math.min(H, mk.y + R) | 0;
+    ctx.fillStyle = "rgba(200,255,0,0.55)";
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * W + x) * 4;
+        const mn = Math.min(d[i], d[i + 1], d[i + 2]);
+        const mx = Math.max(d[i], d[i + 1], d[i + 2]);
+        if (mn >= th && (mx - mn) <= satMax) ctx.fillRect(x, y, 1, 1);
+      }
+    }
+    const bl = detectBlob(d, W, H, mk.x, mk.y, R, th, satMax);
+    setBlob(bl);
+    if (bl) {
+      ctx.strokeStyle = "#ff5c38"; ctx.lineWidth = 2;
+      ctx.strokeRect(bl.minX, bl.minY, bl.w, bl.h);
+      ctx.fillStyle = "#ff5c38";
+      ctx.beginPath(); ctx.arc(bl.cx, bl.cy, 4, 0, 7); ctx.fill();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step === 1 && marker) redraw(marker, threshold);
+  }, [step, marker, threshold, redraw]);
+
+  const onCanvasTap = (e) => {
+    const c = canvasRef.current;
+    const r = c.getBoundingClientRect();
+    const x = (e.clientX - r.left) * (c.width / r.width);
+    const y = (e.clientY - r.top) * (c.height / r.height);
+    const ff = firstFrameRef.current;
+    if (ff) {
+      const bl = detectBlob(ff.data, ff.width, ff.height, x, y, 90, threshold, satMax);
+      if (bl) { setMarker({ x: bl.cx, y: bl.cy }); return; }
+    }
+    setMarker({ x, y });
+  };
+
+  const runProcessing = async () => {
+    setStep(3); setProgress(0); setError(null);
+    const v = videoRef.current, c = canvasRef.current;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    const W = proc.w, H = proc.h;
+    const pxPerCm = ((blob.w + blob.h) / 2) / stickerCm;
+    const searchR = Math.max(45, ((blob.w + blob.h) / 2) * 2.6);
+    const duration = v.duration;
+    let dt = 1 / fps;
+    if (duration / dt > 1200) dt = duration / 1200;
+    const track = [];
+    let px = marker.x, py = marker.y;
+
+    try {
+      for (let tt = 0; tt <= duration + 1e-4; tt += dt) {
+        const target = Math.min(tt, duration);
+        await seekTo(v, target);
+        ctx.drawImage(v, 0, 0, W, H);
+        const img = ctx.getImageData(0, 0, W, H).data;
+        let res = trackCentroid(img, W, H, px, py, searchR, threshold, satMax);
+        if (!res) res = trackCentroid(img, W, H, px, py, searchR * 2, threshold, satMax);
+        const tracked = !!res;
+        if (res) { px = res.x; py = res.y; }
+        track.push({ t: v.currentTime, x: px, y: py, tracked });
+        ctx.strokeStyle = "#c8ff00"; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(px, py, 9, 0, 7); ctx.stroke();
+        setProgress(target / duration);
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      if (track.length < 8) { setError("El video es demasiado corto."); setStep(2); return; }
+      const m = computeMetrics(track, pxPerCm, person.weight || 0);
+      if (m.quality < 0.4) {
+        setError("Se perdió el sticker en gran parte del video. Ajustá la sensibilidad o mejorá la luz.");
+      }
+      setResult(m);
+      setStep(4);
+    } catch (err) {
+      console.error(err);
+      setError("Error procesando el video.");
+      setStep(2);
+    }
+  };
+
+  const save = () => {
+    onSaved({
+      id: uid(), date: new Date().toISOString(),
+      fps, stickerCm, metrics: result,
+    });
+  };
+
+  const pxPerCm = blob ? ((blob.w + blob.h) / 2) / stickerCm : 0;
+
+  return (
+    <div>
+      <Header onBack={onBack} title="NUEVO ANÁLISIS" />
+      <div className="wrap">
+        <div className="step-dots">
+          {[0, 1, 2, 3].map((i) => <div key={i} className={step >= i ? "on" : ""} />)}
+        </div>
+
+        <video ref={videoRef} src={videoURL || undefined} onLoadedMetadata={onMeta}
+          playsInline muted preload="auto" className="vhidden" />
+
+        {error && (
+          <div className="infobox warn" style={{ marginBottom: 12 }}>
+            <Icon name="alert" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />
+            {error}
+          </div>
+        )}
+
+        {step === 0 && (
+          <div>
+            <div className="seclabel">Paso 1 — Video</div>
+            <div className="infobox" style={{ marginBottom: 14 }}>
+              Filmá <b>de costado</b>, celular quieto y perpendicular. La persona con el
+              sticker blanco de <b>{stickerCm}×{stickerCm} cm</b> en el pecho. <b>Una sola
+              repetición</b> por video. Ideal grabar a 60 fps con la app de Cámara del iPhone.
+            </div>
+            <input ref={fileInputRef} type="file" accept="video/*"
+              onChange={onFile} style={{ display: "none" }} />
+            <button className="btn" onClick={() => fileInputRef.current.click()}>
+              <Icon name="upload" size={16} /> {videoURL ? "Cambiar video" : "Grabar o subir video"}
+            </button>
+            {videoURL && (
+              <div>
+                <div className="row2" style={{ marginTop: 14 }}>
+                  <div>
+                    <label className="fld">FPS del video</label>
+                    <select className="txt" value={fps} onChange={(e) => setFps(+e.target.value)}>
+                      <option value={30}>30 fps</option>
+                      <option value={60}>60 fps</option>
+                      <option value={120}>120 fps</option>
+                      <option value={240}>240 fps</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="fld">Lado del sticker (cm)</label>
+                    <input className="txt" type="number" value={stickerCm}
+                      onChange={(e) => setStickerCm(+e.target.value || 10)} />
+                  </div>
+                </div>
+                <div style={{ marginTop: 16 }}>
+                  <button className="btn primary" onClick={goMark} disabled={proc.w === 0}>
+                    Continuar → marcar sticker
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {step === 1 && (
+          <div>
+            <div className="seclabel">Paso 2 — Marcar el sticker</div>
+            <div className="infobox" style={{ marginBottom: 12 }}>
+              Tocá el <b>sticker blanco</b> sobre la imagen. El recuadro naranja debe
+              encerrar justo el sticker, sin tomar otras zonas blancas.
+            </div>
+            <div className="cvwrap" onPointerDown={onCanvasTap}>
+              <canvas ref={canvasRef} className="frame" />
+              {!marker && (
+                <div style={{
+                  position: "absolute", inset: 0, display: "flex",
+                  alignItems: "center", justifyContent: "center", pointerEvents: "none",
+                }}>
+                  <span className="pill"><Icon name="crosshair" size={12} /> Tocá el sticker</span>
+                </div>
+              )}
+            </div>
+            {marker && (
+              <div>
+                <label className="fld">Sensibilidad de detección</label>
+                <input type="range" min={100} max={235} value={threshold}
+                  onChange={(e) => setThreshold(+e.target.value)} />
+                <div className="hint">
+                  Menos sensible ← {threshold} → más sensible · ajustá hasta que solo
+                  el sticker quede pintado de verde.
+                </div>
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+              <button className="btn ghost" onClick={() => setStep(0)}>
+                <Icon name="chevron-left" size={14} /> Atrás
+              </button>
+              <button className="btn primary" disabled={!blob} onClick={() => setStep(2)}>
+                Continuar
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === 2 && (
+          <div>
+            <div className="seclabel">Paso 3 — Calibración</div>
+            <div className="card" style={{ marginBottom: 12 }}>
+              <div className="mgrid">
+                <div className="metric">
+                  <div className="mlabel"><Icon name="ruler" size={11} /> Sticker detectado</div>
+                  <div className="mval">{blob ? Math.round((blob.w + blob.h) / 2) : "—"}
+                    <span className="munit">px</span></div>
+                </div>
+                <div className="metric">
+                  <div className="mlabel"><Icon name="target" size={11} /> Escala</div>
+                  <div className="mval alt">{fmt(pxPerCm, 1)}
+                    <span className="munit">px/cm</span></div>
+                </div>
+              </div>
+            </div>
+            <div className="infobox" style={{ marginBottom: 14 }}>
+              Con el sticker de <b>{stickerCm} cm</b>, cada centímetro real equivale a
+              <b> {fmt(pxPerCm, 1)} píxeles</b>. La app va a recorrer el video frame por
+              frame ({fps} fps) midiendo el desplazamiento vertical.
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="btn ghost" onClick={() => setStep(1)}>
+                <Icon name="chevron-left" size={14} /> Reajustar
+              </button>
+              <button className="btn primary" onClick={runProcessing}>
+                <Icon name="play" size={15} /> Analizar
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === 3 && (
+          <div>
+            <div className="seclabel">Procesando</div>
+            <div className="cvwrap"><canvas ref={canvasRef} className="frame" /></div>
+            <div className="progress" style={{ marginTop: 12 }}>
+              <div style={{ width: (progress * 100) + "%" }} />
+            </div>
+            <div className="hint" style={{ textAlign: "center", marginTop: 8 }}>
+              <span className="spin" style={{ verticalAlign: -2, marginRight: 6 }} />
+              Siguiendo el sticker… {Math.round(progress * 100)}%
+            </div>
+          </div>
+        )}
+
+        {step === 4 && result && (
+          <div>
+            <div className="seclabel">Resultado</div>
+            <div className="hero">
+              <div className="hlabel">Velocidad media de empuje</div>
+              <div className="hval">{fmt(result.meanVel)}</div>
+              <div className="hlabel">metros / segundo</div>
+              {previousMean != null && (
+                <div style={{ marginTop: 8 }}>
+                  <span className={"delta " + (result.meanVel >= previousMean ? "up" : "down")}>
+                    {result.meanVel >= previousMean ? "▲" : "▼"}{" "}
+                    {fmt(result.meanVel - previousMean)} m/s vs. análisis anterior
+                  </span>
+                </div>
+              )}
+            </div>
+            <div style={{ marginTop: 12 }}><MetricsGrid m={result} /></div>
+            <div className="seclabel">Curva de movimiento</div>
+            <PerfChart series={result.series} concentricDuration={result.concentricDuration} />
+            <div style={{ margin: "10px 0" }}>
+              <span className={"pill " + (result.quality > 0.85 ? "good" : "warn")}>
+                <Icon name="target" size={11} /> Seguimiento {Math.round(result.quality * 100)}%
+              </span>
+              {result.quality <= 0.85 && (
+                <span className="hint" style={{ marginLeft: 8 }}>
+                  seguimiento bajo — los datos pueden ser imprecisos
+                </span>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+              <button className="btn ghost" onClick={() => { setStep(0); setResult(null); }}>
+                <Icon name="rotate" size={14} /> Otro
+              </button>
+              <button className="btn primary" onClick={save}>
+                <Icon name="check" size={15} /> Guardar análisis
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   APP
+   ============================================================ */
+function App() {
+  const [view, setView] = useState("people");
+  const [people, setPeople] = useState(() => loadPeople());
+  const [analysesByPerson, setAnalysesByPerson] = useState({});
+  const [selected, setSelected] = useState(null);
+  const [openResult, setOpenResult] = useState(null);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+
+  const openPerson = (p) => {
+    setSelected(p);
+    setAnalysesByPerson((s) => (s[p.id] ? s : Object.assign({}, s, { [p.id]: loadAnalyses(p.id) })));
+    setView("person");
+  };
+
+  const handleSavePerson = (person) => {
+    const next = people.some((x) => x.id === person.id)
+      ? people.map((x) => (x.id === person.id ? person : x))
+      : people.concat([person]);
+    setPeople(next);
+    savePeople(next);
+    if (selected && selected.id === person.id) setSelected(person);
+    setFormOpen(false);
+    setEditing(null);
+  };
+
+  const handleDeletePerson = () => {
+    if (!window.confirm("¿Eliminar este perfil y todos sus análisis?")) return;
+    const next = people.filter((x) => x.id !== selected.id);
+    setPeople(next);
+    savePeople(next);
+    try { localStorage.removeItem(keyAnalyses(selected.id)); } catch (e) {}
+    setView("people");
+    setSelected(null);
+  };
+
+  const handleSavedAnalysis = (analysis) => {
+    const list = (analysesByPerson[selected.id] || []).concat([analysis]);
+    setAnalysesByPerson((s) => Object.assign({}, s, { [selected.id]: list }));
+    saveAnalyses(selected.id, list);
+    setView("person");
+  };
+
+  const currentAnalyses = selected ? (analysesByPerson[selected.id] || []) : [];
+  const lastMean = currentAnalyses.length
+    ? currentAnalyses.slice().sort((a, b) => new Date(b.date) - new Date(a.date))[0].metrics.meanVel
+    : null;
+
+  return (
+    <div className="dinamo">
+      <style>{CSS}</style>
+      {view === "people" && (
+        <PeopleScreen people={people} onOpen={openPerson}
+          onAdd={() => { setEditing(null); setFormOpen(true); }} />
+      )}
+      {view === "person" && selected && (
+        <PersonScreen person={selected} analyses={currentAnalyses}
+          onBack={() => setView("people")}
+          onNewAnalysis={() => setView("analysis")}
+          onOpenResult={(a) => { setOpenResult(a); setView("result"); }}
+          onEdit={() => { setEditing(selected); setFormOpen(true); }}
+          onDelete={handleDeletePerson} />
+      )}
+      {view === "analysis" && selected && (
+        <AnalysisScreen person={selected} previousMean={lastMean}
+          onBack={() => setView("person")} onSaved={handleSavedAnalysis} />
+      )}
+      {view === "result" && openResult && (
+        <ResultScreen analysis={openResult} onBack={() => setView("person")} />
+      )}
+      {formOpen && (
+        <PersonForm initial={editing} onSave={handleSavePerson}
+          onClose={() => { setFormOpen(false); setEditing(null); }} />
+      )}
+    </div>
+  );
+}
+
+document.getElementById("boot").remove();
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
