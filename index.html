@@ -418,10 +418,6 @@ const CSS = `
   animation: dspin .7s linear infinite; display: inline-block;
 }
 @keyframes dspin { to { transform: rotate(360deg); } }
-.dinamo .vhidden {
-  position: fixed; width: 2px; height: 2px; opacity: 0;
-  pointer-events: none; left: -20px; top: -20px;
-}
 `;
 
 /* ============================================================
@@ -747,6 +743,8 @@ function AnalysisScreen({ person, onBack, onSaved, previousMean }) {
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [diag, setDiag] = useState("");
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -757,37 +755,102 @@ function AnalysisScreen({ person, onBack, onSaved, previousMean }) {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
     setError(null);
-    setVideoURL(URL.createObjectURL(file));
+    setDiag("archivo: " + file.name + " · " + Math.round(file.size / 1024) +
+      " KB · tipo: " + (file.type || "desconocido"));
+    const url = URL.createObjectURL(file);
+    setVideoURL(url);
+    // forzar recarga del elemento video
+    setTimeout(() => {
+      const v = videoRef.current;
+      if (v) { try { v.load(); } catch (er) {} }
+    }, 30);
   };
 
   const onMeta = () => {
     const v = videoRef.current;
     if (!v) return;
-    const maxW = 900;
-    const scale = v.videoWidth > maxW ? maxW / v.videoWidth : 1;
-    setProc({ w: Math.round(v.videoWidth * scale), h: Math.round(v.videoHeight * scale) });
+    setDiag((d) => d + " · " + v.videoWidth + "x" + v.videoHeight +
+      " · " + (v.duration ? v.duration.toFixed(1) + "s" : "?"));
   };
 
-  const seekTo = (v, tt) => new Promise((res) => {
-    const h = () => { v.removeEventListener("seeked", h); res(); };
-    v.addEventListener("seeked", h);
-    v.currentTime = tt;
+  const onVideoError = () => {
+    const v = videoRef.current;
+    const err = v && v.error;
+    const codes = { 1: "abortado", 2: "red", 3: "fallo de decodificación", 4: "formato no soportado" };
+    setError("El navegador no pudo procesar el video" +
+      (err ? " — " + (codes[err.code] || ("error " + err.code)) : "") +
+      ". Probá un clip más corto o grabado en formato 'Más compatible'.");
+  };
+
+  // Espera a que el video esté listo para leer frames
+  const ensureReady = (v) => new Promise((resolve, reject) => {
+    if (v.readyState >= 2 && v.videoWidth > 0) return resolve();
+    let settled = false;
+    const ok = () => {
+      if (settled) return;
+      if (v.videoWidth > 0 && v.readyState >= 2) { settled = true; cleanup(); resolve(); }
+    };
+    const bad = () => { if (settled) return; settled = true; cleanup(); reject(new Error("el video no se pudo decodificar")); };
+    const cleanup = () => {
+      v.removeEventListener("loadeddata", ok);
+      v.removeEventListener("canplay", ok);
+      v.removeEventListener("loadedmetadata", ok);
+      v.removeEventListener("error", bad);
+      clearInterval(poll);
+    };
+    v.addEventListener("loadeddata", ok);
+    v.addEventListener("canplay", ok);
+    v.addEventListener("loadedmetadata", ok);
+    v.addEventListener("error", bad);
+    const poll = setInterval(ok, 200);
+    try { v.load(); } catch (e) {}
+    setTimeout(bad, 8000);
+  });
+
+  // Posiciona el video en 'tt' y dibuja el frame en el canvas (con red de seguridad)
+  const grabFrame = (v, ctx, W, H, tt) => new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      v.removeEventListener("seeked", onSeeked);
+      clearTimeout(to);
+      try { ctx.drawImage(v, 0, 0, W, H); } catch (e) {}
+      resolve();
+    };
+    const onSeeked = () => finish();
+    v.addEventListener("seeked", onSeeked);
+    const to = setTimeout(finish, 900); // si 'seeked' no llega, seguimos igual
+    try { v.currentTime = tt; } catch (e) { finish(); }
   });
 
   const goMark = async () => {
+    setError(null);
     const v = videoRef.current, c = canvasRef.current;
-    if (!v || !c || proc.w === 0) { setError("El video no se cargó bien."); return; }
-    c.width = proc.w; c.height = proc.h;
-    const ctx = c.getContext("2d", { willReadFrequently: true });
+    if (!v || !c) { setError("Error interno: faltan elementos."); return; }
+    setBusy(true);
     try {
-      await seekTo(v, 0.05);
-      ctx.drawImage(v, 0, 0, proc.w, proc.h);
-      firstFrameRef.current = ctx.getImageData(0, 0, proc.w, proc.h);
+      try { v.pause(); } catch (e) {}
+      await ensureReady(v);
+      const maxW = 900;
+      const scale = v.videoWidth > maxW ? maxW / v.videoWidth : 1;
+      const w = Math.round(v.videoWidth * scale);
+      const h = Math.round(v.videoHeight * scale);
+      if (w < 2 || h < 2) throw new Error("el video no tiene dimensiones válidas");
+      setProc({ w: w, h: h });
+      c.width = w; c.height = h;
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      const dur = v.duration && isFinite(v.duration) ? v.duration : 1;
+      await grabFrame(v, ctx, w, h, Math.min(0.08, dur * 0.05));
+      firstFrameRef.current = ctx.getImageData(0, 0, w, h);
       setMarker(null); setBlob(null);
       setStep(1);
     } catch (err) {
       console.error(err);
-      setError("No se pudo leer el video. Probá con otro formato (mp4).");
+      setError("No se pudo leer el video: " + (err.message || err) +
+        ". Probá con un clip más corto (3-4 s) grabado en 'Más compatible'.");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -852,8 +915,7 @@ function AnalysisScreen({ person, onBack, onSaved, previousMean }) {
     try {
       for (let tt = 0; tt <= duration + 1e-4; tt += dt) {
         const target = Math.min(tt, duration);
-        await seekTo(v, target);
-        ctx.drawImage(v, 0, 0, W, H);
+        await grabFrame(v, ctx, W, H, target);
         const img = ctx.getImageData(0, 0, W, H).data;
         let res = trackCentroid(img, W, H, px, py, searchR, threshold, satMax);
         if (!res) res = trackCentroid(img, W, H, px, py, searchR * 2, threshold, satMax);
@@ -896,13 +958,27 @@ function AnalysisScreen({ person, onBack, onSaved, previousMean }) {
           {[0, 1, 2, 3].map((i) => <div key={i} className={step >= i ? "on" : ""} />)}
         </div>
 
-        <video ref={videoRef} src={videoURL || undefined} onLoadedMetadata={onMeta}
-          playsInline muted preload="auto" className="vhidden" />
+        <video ref={videoRef} src={videoURL || undefined}
+          onLoadedMetadata={onMeta} onError={onVideoError}
+          playsInline muted controls preload="auto"
+          style={{
+            width: "100%", marginTop: 4,
+            display: videoURL ? "block" : "none",
+            border: "1px solid var(--border)", background: "#000",
+          }} />
 
         {error && (
           <div className="infobox warn" style={{ marginBottom: 12 }}>
             <Icon name="alert" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />
             {error}
+          </div>
+        )}
+        {diag && step === 0 && (
+          <div className="hint" style={{
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+            marginBottom: 8, wordBreak: "break-all",
+          }}>
+            ⓘ {diag}
           </div>
         )}
 
@@ -938,9 +1014,14 @@ function AnalysisScreen({ person, onBack, onSaved, previousMean }) {
                   </div>
                 </div>
                 <div style={{ marginTop: 16 }}>
-                  <button className="btn primary" onClick={goMark} disabled={proc.w === 0}>
-                    Continuar → marcar sticker
+                  <button className="btn primary" onClick={goMark} disabled={busy}>
+                    {busy ? (
+                      <span><span className="spin" style={{ verticalAlign: -2, marginRight: 6 }} /> Leyendo video…</span>
+                    ) : "Continuar → marcar sticker"}
                   </button>
+                  <div className="hint" style={{ marginTop: 8, textAlign: "center" }}>
+                    Si tarda, dejá que el video termine de cargar y reintentá.
+                  </div>
                 </div>
               </div>
             )}
