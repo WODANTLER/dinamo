@@ -390,7 +390,10 @@ body.intro .hint .txt{animation:txtin .8s var(--ease) 1.45s both}
 <section class="frame" data-frame>
   <div class="frame__pin">
     <img class="shot on" data-shot src="img/frame-01.jpg" alt="">
-    <img class="shot" data-shot src="img/frame-02.jpg" alt="">
+    <picture>
+      <source media="(max-width:760px)" srcset="img/frame-02m.jpg">
+      <img class="shot" data-shot src="img/frame-02.jpg" alt="">
+    </picture>
   </div>
 </section>
 </div>
@@ -471,7 +474,8 @@ body.intro .hint .txt{animation:txtin .8s var(--ease) 1.45s both}
        así la frase ya está armada cuando la foto llega arriba */
     const e=(innerHeight-r.top)/innerHeight;
     const dentro=clamp((e-0.16)/0.72);
-    const fuera=clamp((p-0.24)/0.16);
+    const movil=innerWidth<=760;
+    const fuera=clamp((p-(movil?0.12:0.24))/(movil?0.13:0.16));
     const vis=dentro*(1-fuera);
     frase(dentro);
     quote.style.opacity=vis.toFixed(3);
