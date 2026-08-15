@@ -473,13 +473,15 @@ body.intro .hint .txt{animation:txtin .8s var(--ease) 1.45s both}
     /* la entrada se mide desde que la foto asoma por abajo, no desde que se ancla:
        así la frase ya está armada cuando la foto llega arriba */
     const e=(innerHeight-r.top)/innerHeight;
-    const dentro=clamp((e-0.16)/0.72);
     const movil=innerWidth<=760;
-    const fuera=clamp((p-(movil?0.12:0.24))/(movil?0.13:0.16));
+    /* en móvil todo se mide sobre el mismo recorrido continuo: la frase
+       queda armada antes de que la foto llegue arriba y despeja enseguida */
+    const dentro=movil ? clamp((e-0.08)/0.50) : clamp((e-0.16)/0.72);
+    const fuera =movil ? clamp((e-0.88)/0.26) : clamp((p-0.24)/0.16);
     const vis=dentro*(1-fuera);
     frase(dentro);
     quote.style.opacity=vis.toFixed(3);
-    dim.style.opacity=(vis*0.56).toFixed(3);
+    dim.style.opacity=(vis*(movil?0.70:0.56)).toFixed(3);
     const bl=(vis*6).toFixed(1);
     document.querySelectorAll('.shot').forEach(im=>{
       im.style.setProperty('--bl',bl+'px');
